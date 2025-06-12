@@ -21,6 +21,8 @@ import sys
 import threading
 import time
 
+from valkey import RedisError
+
 from api.utils.log_utils import initRootLogger, get_project_base_directory
 from graphrag.general.index import run_graphrag
 from graphrag.utils import get_llm_cache, set_llm_cache, get_tags_from_cache, set_tags_to_cache
@@ -100,9 +102,10 @@ CURRENT_TASKS = {}
 MAX_CONCURRENT_TASKS = int(os.environ.get('MAX_CONCURRENT_TASKS', "5"))
 MAX_CONCURRENT_CHUNK_BUILDERS = int(os.environ.get('MAX_CONCURRENT_CHUNK_BUILDERS', "1"))
 MAX_CONCURRENT_MINIO = int(os.environ.get('MAX_CONCURRENT_MINIO', '10'))
-task_limiter = trio.CapacityLimiter(MAX_CONCURRENT_TASKS)
+task_limiter = trio.Semaphore(MAX_CONCURRENT_TASKS)
 chunk_limiter = trio.CapacityLimiter(MAX_CONCURRENT_CHUNK_BUILDERS)
 minio_limiter = trio.CapacityLimiter(MAX_CONCURRENT_MINIO)
+kg_limiter = trio.CapacityLimiter(2)
 WORKER_HEARTBEAT_TIMEOUT = int(os.environ.get('WORKER_HEARTBEAT_TIMEOUT', '120'))
 stop_event = threading.Event()
 
@@ -186,18 +189,44 @@ async def collect():
     global CONSUMER_NAME, DONE_TASKS, FAILED_TASKS
     global UNACKED_ITERATOR
     svr_queue_names = get_svr_queue_names()
+    redis_msg = None
+
     try:
         if not UNACKED_ITERATOR:
-            UNACKED_ITERATOR = REDIS_CONN.get_unacked_iterator(svr_queue_names, SVR_CONSUMER_GROUP_NAME, CONSUMER_NAME)
-        try:
-            redis_msg = next(UNACKED_ITERATOR)
-        except StopIteration:
+            UNACKED_ITERATOR = None
+            logging.debug("Rebuilding UNACKED_ITERATOR due to it is None")
+            try:
+                UNACKED_ITERATOR = REDIS_CONN.get_unacked_iterator(svr_queue_names, SVR_CONSUMER_GROUP_NAME, CONSUMER_NAME)
+                logging.debug("UNACKED_ITERATOR rebuilt successfully")
+            except RedisError as e:
+                UNACKED_ITERATOR = None
+                logging.warning(f"Failed to rebuild UNACKED_ITERATOR: {e}")
+
+        if UNACKED_ITERATOR:
+            try:
+                redis_msg = next(UNACKED_ITERATOR)
+            except StopIteration:
+                UNACKED_ITERATOR = None
+                logging.debug("UNACKED_ITERATOR exhausted, clearing")
+
+            except Exception as e:
+                UNACKED_ITERATOR = None
+                logging.warning(f"UNACKED_ITERATOR raised exception: {e}")
+
+        if not redis_msg:
             for svr_queue_name in svr_queue_names:
-                redis_msg = REDIS_CONN.queue_consumer(svr_queue_name, SVR_CONSUMER_GROUP_NAME, CONSUMER_NAME)
-                if redis_msg:
-                    break
-    except Exception:
-        logging.exception("collect got exception")
+                try:
+                    redis_msg = REDIS_CONN.queue_consumer(svr_queue_name, SVR_CONSUMER_GROUP_NAME, CONSUMER_NAME)
+                    if redis_msg:
+                        break
+                except RedisError as e:
+                    logging.warning(f"queue_consumer failed for {svr_queue_name}: {e}")
+                    continue
+
+    except Exception as e:
+        logging.exception(f"collect task encountered unexpected exception: {e}")
+        UNACKED_ITERATOR = None
+        await trio.sleep(1)
         return None, None
 
     if not redis_msg:
@@ -276,28 +305,27 @@ async def build_chunks(task, progress_callback):
 
     async def upload_to_minio(document, chunk):
         try:
-            async with minio_limiter:
-                d = copy.deepcopy(document)
-                d.update(chunk)
-                d["id"] = xxhash.xxh64((chunk["content_with_weight"] + str(d["doc_id"])).encode("utf-8")).hexdigest()
-                d["create_time"] = str(datetime.now()).replace("T", " ")[:19]
-                d["create_timestamp_flt"] = datetime.now().timestamp()
-                if not d.get("image"):
-                    _ = d.pop("image", None)
-                    d["img_id"] = ""
-                    docs.append(d)
-                    return
-
-                output_buffer = BytesIO()
-                if isinstance(d["image"], bytes):
-                    output_buffer = BytesIO(d["image"])
-                else:
-                    d["image"].save(output_buffer, format='JPEG')
-                await trio.to_thread.run_sync(lambda: STORAGE_IMPL.put(task["kb_id"], d["id"], output_buffer.getvalue()))
-
-                d["img_id"] = "{}-{}".format(task["kb_id"], d["id"])
-                del d["image"]
+            d = copy.deepcopy(document)
+            d.update(chunk)
+            d["id"] = xxhash.xxh64((chunk["content_with_weight"] + str(d["doc_id"])).encode("utf-8")).hexdigest()
+            d["create_time"] = str(datetime.now()).replace("T", " ")[:19]
+            d["create_timestamp_flt"] = datetime.now().timestamp()
+            if not d.get("image"):
+                _ = d.pop("image", None)
+                d["img_id"] = ""
                 docs.append(d)
+                return
+
+            output_buffer = BytesIO()
+            if isinstance(d["image"], bytes):
+                output_buffer = BytesIO(d["image"])
+            else:
+                d["image"].save(output_buffer, format='JPEG')
+            async with minio_limiter:
+                await trio.to_thread.run_sync(lambda: STORAGE_IMPL.put(task["kb_id"], d["id"], output_buffer.getvalue()))
+            d["img_id"] = "{}-{}".format(task["kb_id"], d["id"])
+            del d["image"]
+            docs.append(d)
         except Exception:
             logging.exception(
                 "Saving image of chunk {}/{}/{} got exception".format(task["location"], task["name"], d["id"]))
@@ -368,6 +396,10 @@ async def build_chunks(task, progress_callback):
 
         docs_to_tag = []
         for d in docs:
+            task_canceled = TaskService.do_cancel(task["id"])
+            if task_canceled:
+                progress_callback(-1, msg="Task has been canceled.")
+                return
             if settings.retrievaler.tag_content(tenant_id, kb_ids, d, all_tags, topn_tags=topn_tags, S=S) and len(d[TAG_FLD]) > 0:
                 examples.append({"content": d["content_with_weight"], TAG_FLD: d[TAG_FLD]})
             else:
@@ -532,11 +564,10 @@ async def do_handle_task(task):
         # bind LLM for raptor
         chat_model = LLMBundle(task_tenant_id, LLMType.CHAT, llm_name=task_llm_id, lang=task_language)
         # run RAPTOR
-        chunks, token_count = await run_raptor(task, chat_model, embedding_model, vector_size, progress_callback)
+        async with kg_limiter:
+            chunks, token_count = await run_raptor(task, chat_model, embedding_model, vector_size, progress_callback)
     # Either using graphrag or Standard chunking methods
     elif task.get("task_type", "") == "graphrag":
-        global task_limiter
-        task_limiter = trio.CapacityLimiter(2)
         if not task_parser_config.get("graphrag", {}).get("use_graphrag", False):
             return
         graphrag_conf = task["kb_parser_config"].get("graphrag", {})
@@ -544,7 +575,8 @@ async def do_handle_task(task):
         chat_model = LLMBundle(task_tenant_id, LLMType.CHAT, llm_name=task_llm_id, lang=task_language)
         with_resolution = graphrag_conf.get("resolution", False)
         with_community = graphrag_conf.get("community", False)
-        await run_graphrag(task, task_language, with_resolution, with_community, chat_model, embedding_model, progress_callback)
+        async with kg_limiter:
+            await run_graphrag(task, task_language, with_resolution, with_community, chat_model, embedding_model, progress_callback)
         progress_callback(prog=1.0, msg="Knowledge Graph done ({:.2f}s)".format(timer() - start_ts))
         return
     else:
@@ -577,8 +609,22 @@ async def do_handle_task(task):
     start_ts = timer()
     doc_store_result = ""
     es_bulk_size = 4
+
+    async def delete_image(kb_id, chunk_id):
+        try:
+            async with minio_limiter:
+                STORAGE_IMPL.delete(kb_id, chunk_id)
+        except Exception:
+            logging.exception(
+                "Deleting image of chunk {}/{}/{} got exception".format(task["location"], task["name"], chunk_id))
+            raise
+
     for b in range(0, len(chunks), es_bulk_size):
         doc_store_result = await trio.to_thread.run_sync(lambda: settings.docStoreConn.insert(chunks[b:b + es_bulk_size], search.index_name(task_tenant_id), task_dataset_id))
+        task_canceled = TaskService.do_cancel(task_id)
+        if task_canceled:
+            progress_callback(-1, msg="Task has been canceled.")
+            return
         if b % 128 == 0:
             progress_callback(prog=0.8 + 0.1 * (b + 1) / len(chunks), msg="")
         if doc_store_result:
@@ -592,7 +638,11 @@ async def do_handle_task(task):
         except DoesNotExist:
             logging.warning(f"do_handle_task update_chunk_ids failed since task {task['id']} is unknown.")
             doc_store_result = await trio.to_thread.run_sync(lambda: settings.docStoreConn.delete({"id": chunk_ids}, search.index_name(task_tenant_id), task_dataset_id))
+            async with trio.open_nursery() as nursery:
+                for chunk_id in chunk_ids:
+                    nursery.start_soon(delete_image, task_dataset_id, chunk_id)
             return
+        
     logging.info("Indexing doc({}), page({}-{}), chunks({}), elapsed: {:.2f}".format(task_document_name, task_from_page,
                                                                                      task_to_page, len(chunks),
                                                                                      timer() - start_ts))
@@ -713,7 +763,11 @@ def recover_pending_tasks():
             redis_lock.release()
             stop_event.wait(60)
         
-
+async def task_manager():
+    try:
+        await handle_task()
+    finally:
+        task_limiter.release()
 
 
 async def main():
@@ -742,8 +796,8 @@ async def main():
     async with trio.open_nursery() as nursery:
         nursery.start_soon(report_status)
         while not stop_event.is_set():
-            async with task_limiter:
-                nursery.start_soon(handle_task)
+            await task_limiter.acquire()
+            nursery.start_soon(task_manager)
     logging.error("BUG!!! You should not reach here!!!")
 
 if __name__ == "__main__":
